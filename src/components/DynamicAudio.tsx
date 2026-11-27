@@ -1,0 +1,97 @@
+import React from 'react';
+import { Audio, Sequence, staticFile } from 'remotion';
+import { AudioConfig, VideoClip } from '../types/project';
+
+const resolveMediaSource = (src: string) => {
+  if (!src) return '';
+  if (src.startsWith('http://') || src.startsWith('https://')) return src;
+  const cleaned = src.replace(/^\/?(public\/)?/, '');
+  return staticFile(cleaned);
+};
+
+interface Props {
+  audioConfig: AudioConfig;
+  defaultVideoAudio?: string;
+  clips?: VideoClip[];
+  fps?: number;
+}
+
+export const DynamicAudio: React.FC<Props> = ({
+  audioConfig,
+  defaultVideoAudio,
+  clips,
+  fps = 30,
+}) => {
+  if (!audioConfig) return null;
+
+  const {
+    useOriginalVideoAudio = true,
+    originalAudioVolume,
+    customAudioPath,
+    customAudioVolume = 1.0,
+    backgroundMusicPath,
+    bgmVolume = 0.15,
+    sfxEvents = [],
+  } = audioConfig;
+
+  const origVol =
+    originalAudioVolume !== undefined
+      ? originalAudioVolume
+      : customAudioPath
+        ? 0.25
+        : 1.0;
+
+  const sfxDuration = Math.max(15, Math.round(fps * 1.4));
+
+  return (
+    <>
+      {/* 1. Original Video Audio (plays when useOriginalVideoAudio is true; mixes quietly if customAudioPath also exists) */}
+      {useOriginalVideoAudio && origVol > 0 && (
+        clips && clips.length > 0 ? (
+          clips.map((clip, idx) => (
+            <Sequence
+              key={idx}
+              from={clip.startFrame}
+              durationInFrames={clip.durationInFrames}
+            >
+              <Audio src={resolveMediaSource(clip.source)} volume={origVol} />
+            </Sequence>
+          ))
+        ) : defaultVideoAudio ? (
+          <Audio src={resolveMediaSource(defaultVideoAudio)} volume={origVol} />
+        ) : null
+      )}
+
+      {/* 2. Custom Audio / Voiceover MP3 (played if specified) */}
+      {customAudioPath && (
+        <Audio src={resolveMediaSource(customAudioPath)} volume={customAudioVolume} />
+      )}
+
+      {/* 3. Background Music (loops automatically across the whole video) */}
+      {backgroundMusicPath && (
+        <Audio
+          src={resolveMediaSource(backgroundMusicPath)}
+          volume={bgmVolume}
+          loop
+        />
+      )}
+
+      {/* 4. Dynamic SFX Events */}
+      {sfxEvents?.map((sfx, idx) => {
+        const soundFile =
+          sfx.type.endsWith('.wav') || sfx.type.endsWith('.mp3')
+            ? sfx.type
+            : `${sfx.type}.wav`;
+        return (
+          <Sequence
+            key={idx}
+            from={sfx.frame}
+            durationInFrames={sfxDuration}
+          >
+            <Audio src={resolveMediaSource(soundFile)} volume={sfx.volume ?? 0.7} />
+          </Sequence>
+        );
+      })}
+    </>
+  );
+};
