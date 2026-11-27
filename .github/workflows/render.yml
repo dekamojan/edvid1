@@ -1,0 +1,200 @@
+name: Render Video with Remotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target folder (contoh: "video3"), beberapa folder ("video1, video2, video3"), path ("public/default_project.json"), atau "all"'
+        required: true
+        default: 'all'
+
+  # Render otomatis dimatikan agar upload file tidak memicu render yang belum siap.
+  # Jika ingin mengaktifkan kembali, cukup hapus tanda pagar (#) di bawah ini:
+  # push:
+  #   paths:
+  #     - 'public/projects/**/project.json'
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: true
+
+      - name: ⚙️ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm ci
+
+      - name: 🌐 Ensure Remotion Headless Chrome & FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npx remotion browser ensure
+
+      - name: 🎬 Render Remotion Videos
+        run: |
+          mkdir -p output
+          TARGET_FILES=()
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT_TARGET="${{ github.event.inputs.target }}"
+            echo "Mode: Manual Workflow Dispatch"
+            echo "Input Target: $INPUT_TARGET"
+
+            if [ "$INPUT_TARGET" = "all" ]; then
+              for f in public/projects/*/project.json; do
+                [ -f "$f" ] && TARGET_FILES+=("$f")
+              done
+              if [ ${#TARGET_FILES[@]} -eq 0 ] && [ -f "public/default_project.json" ]; then
+                TARGET_FILES+=("public/default_project.json")
+              fi
+            else
+              IFS=',' read -ra ADDR <<< "$INPUT_TARGET"
+              for item in "${ADDR[@]}"; do
+                trimmed=$(echo "$item" | xargs)
+                if [ -f "$trimmed" ]; then
+                  TARGET_FILES+=("$trimmed")
+                elif [ -f "public/projects/$trimmed/project.json" ]; then
+                  TARGET_FILES+=("public/projects/$trimmed/project.json")
+                elif [ -f "public/$trimmed" ]; then
+                  TARGET_FILES+=("public/$trimmed")
+                else
+                  echo "⚠️ Target tidak ditemukan: $trimmed"
+                fi
+              done
+            fi
+          else
+            echo "Mode: Auto Push Trigger"
+            echo "Mendeteksi file project.json yang berubah pada commit ${{ github.sha }}..."
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -E '^public/projects/.+/project\.json$' || true)
+            for f in $CHANGED_FILES; do
+              [ -f "$f" ] && TARGET_FILES+=("$f")
+            done
+            if [ ${#TARGET_FILES[@]} -eq 0 ] && [ -f "public/default_project.json" ]; then
+              TARGET_FILES+=("public/default_project.json")
+            fi
+          fi
+
+          echo "========================================="
+          echo "Total file yang akan dirender: ${#TARGET_FILES[@]}"
+          for file in "${TARGET_FILES[@]}"; do
+            echo " - $file"
+          done
+          echo "========================================="
+
+          if [ ${#TARGET_FILES[@]} -eq 0 ]; then
+            echo "❌ Tidak ada project.json yang valid untuk dirender!"
+            exit 1
+          fi
+
+          for PROJECT_FILE in "${TARGET_FILES[@]}"; do
+            if [[ "$PROJECT_FILE" =~ public/projects/([^/]+)/project\.json ]]; then
+              FOLDER_NAME="${BASH_REMATCH[1]}"
+              OUTPUT_NAME="${FOLDER_NAME}.mp4"
+            else
+              OUTPUT_NAME="video_edited.mp4"
+            fi
+
+            echo ""
+            echo "========================================="
+            echo "🔍 Validasi file media untuk: $PROJECT_FILE"
+            echo "========================================="
+
+            # Validasi keberadaan file video/audio sebelum memanggil Remotion
+            node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const pFile = process.argv[1];
+            const folderName = process.argv[2];
+
+            try {
+              let raw = fs.readFileSync(pFile, "utf8");
+              let data = JSON.parse(raw);
+
+              // Auto-sinkronisasi jika nama folder tidak cocok dengan slug di JSON (misal di generator tertulis video2 tapi ditaruh di video1)
+              if (folderName && data.projectId && data.projectId !== folderName) {
+                console.log(`⚡ SINKRONISASI OTOMATIS: Folder proyek adalah "${folderName}", tetapi project.json masih berisi slug "${data.projectId}".`);
+                console.log(`   Menyelaraskan semua path "projects/${data.projectId}/" -> "projects/${folderName}/"...`);
+                raw = raw.split(`projects/${data.projectId}/`).join(`projects/${folderName}/`);
+                data = JSON.parse(raw);
+                data.projectId = folderName;
+                fs.writeFileSync(pFile, JSON.stringify(data, null, 2), "utf8");
+                console.log(`   ✅ File project.json berhasil diselaraskan dengan folder "${folderName}".`);
+              }
+
+              const checkList = [];
+              if (data.clips && data.clips.length > 0) {
+                data.clips.forEach(c => c.source && checkList.push({ key: "clips[]", src: c.source }));
+              } else if (data.videoSource) {
+                checkList.push({ key: "videoSource", src: data.videoSource });
+              }
+              if (data.audioConfig && data.audioConfig.customAudioPath) {
+                checkList.push({ key: "customAudioPath", src: data.audioConfig.customAudioPath });
+              }
+
+              let hasError = false;
+              for (const item of checkList) {
+                if (item.src.startsWith("http://") || item.src.startsWith("https://")) continue;
+                const rel = item.src.replace(/^\/?(public\/)?/, "");
+                const full = path.join("public", rel);
+                if (!fs.existsSync(full)) {
+                  console.error("\n❌ ========================================================");
+                  console.error("❌ ERROR [404 Not Found]: File media tidak ada di GitHub!");
+                  console.error("   Properti JSON : " + item.key);
+                  console.error("   Path di JSON  : " + item.src);
+                  console.error("   Lokasi dicari : " + full);
+                  const parentDir = path.dirname(full);
+                  if (fs.existsSync(parentDir)) {
+                    console.error("\n📁 Isi folder " + parentDir + " di GitHub saat ini:");
+                    const files = fs.readdirSync(parentDir);
+                    if (files.length === 0) console.error("   (Folder kosong!)");
+                    else files.forEach(f => console.error("   - " + f));
+                  } else {
+                    console.error("\n📁 Folder " + parentDir + " belum ada di GitHub!");
+                  }
+                  console.error("\n💡 Solusi:");
+                  console.error("   1. Pastikan file " + path.basename(full) + " sudah di-upload/push ke folder " + parentDir);
+                  console.error("   2. Perhatikan huruf besar/kecil (Linux case-sensitive: tesd.mp4 vs tesd.MP4)");
+                  console.error("========================================================\n");
+                  hasError = true;
+                }
+              }
+              if (hasError) process.exit(1);
+            } catch (err) {
+              console.error("Gagal membaca atau mem-parse JSON: " + err.message);
+              process.exit(1);
+            }
+            ' "$PROJECT_FILE" "$FOLDER_NAME"
+
+            echo "✅ Semua file media terverifikasi ada."
+            echo "🎬 Rendering: $PROJECT_FILE -> output/$OUTPUT_NAME"
+
+            npx remotion render src/index.ts UniversalVideo "output/$OUTPUT_NAME" \
+              --props="$PROJECT_FILE" \
+              --concurrency=4 \
+              --gl=angle
+          done
+
+          # Jika hanya merender 1 folder, beri nama zip artifact sesuai nama foldernya
+          if [ ${#TARGET_FILES[@]} -eq 1 ] && [ -n "$FOLDER_NAME" ]; then
+            echo "ARTIFACT_NAME=$FOLDER_NAME" >> $GITHUB_ENV
+          else
+            echo "ARTIFACT_NAME=rendered-videos" >> $GITHUB_ENV
+          fi
+
+      - name: 🚀 Upload Video Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME || 'rendered-videos' }}
+          path: output/*.mp4
+          retention-days: 14
